@@ -1,0 +1,74 @@
+name: Publish a release
+
+# Publishes an Android release of Retail Manager from a branch publish/vX.Y.Z that holds release/: the APK built and
+# checked by the app's code repository, its notes, and the tag. The APK is checked once more here: it must be signed
+# with the app's key (SIGNER_SHA256), or phones would refuse it as an update. The branch is deleted afterwards.
+
+on:
+  push:
+    branches: ['publish/**']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  # SHA-256 of the app's signing certificate (android-signing/ in the code repository).
+  SIGNER_SHA256: 95b8fea23e48effc3f97a0decb6ca0508d0510d37ca726908c6d3b136d0b1bf5
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          TAG="${BRANCH#publish/}"
+          if ! [[ "$TAG" =~ ^v[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]]; then
+            echo "::error::Branch $BRANCH is not publish/vX.Y.Z"; exit 1
+          fi
+          VERSION="${TAG#v}"
+          APK="release/RetailManager-$VERSION.apk"
+          NOTES="release/release-notes.md"
+          test -f "$APK" || { echo "::error::$APK is missing"; exit 1; }
+          test -f "$NOTES" || echo "Retail Manager $VERSION" > "$NOTES"
+          [ "$(tr -d '[:space:]' < release/tag.txt)" = "$TAG" ] || { echo "::error::release/tag.txt does not say $TAG"; exit 1; }
+
+          TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$TOOLS/aapt2" dump badging "$APK" | head -1 | tee "$RUNNER_TEMP/badging.txt"
+          grep -q "name='com.sentinalretail.manager'" "$RUNNER_TEMP/badging.txt" || { echo "::error::Not the Retail Manager app"; exit 1; }
+          grep -q "versionName='$VERSION'" "$RUNNER_TEMP/badging.txt" || { echo "::error::The APK is not version $VERSION"; exit 1; }
+          SIGNER=$("$TOOLS/apksigner" verify --print-certs "$APK" | grep -m1 -oiE 'certificate SHA-256 digest: [0-9a-f]{64}' | awk '{print tolower($4)}')
+          if [ "$SIGNER" != "$SIGNER_SHA256" ]; then
+            echo "::error::The APK is signed with another key ($SIGNER); phones would refuse it as an update."; exit 1
+          fi
+
+          # The same file also as RetailManager.apk, so .../releases/latest/download/RetailManager.apk is a link that
+          # never changes and always downloads the newest version (the app itself uses RetailManager-X.Y.Z.apk).
+          STABLE="$RUNNER_TEMP/RetailManager.apk"
+          cp "$APK" "$STABLE"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" "$STABLE" --clobber
+            gh release edit "$TAG" --title "Retail Manager $VERSION" --notes-file "$NOTES" --draft=false --prerelease=false --latest
+          else
+            gh release create "$TAG" "$APK" "$STABLE" --title "Retail Manager $VERSION" --notes-file "$NOTES" --target "$DEFAULT_BRANCH" --latest
+          fi
+          {
+            echo "### Retail Manager $VERSION is published"
+            echo ""
+            echo "Download link (always the newest version): https://github.com/$GITHUB_REPOSITORY/releases/latest/download/RetailManager.apk"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the hand-over branch
+        if: always()
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: git push origin --delete "refs/heads/$BRANCH" || true
